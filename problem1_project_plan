@@ -1,0 +1,282 @@
+# Smart Beneficiary Targeting Validation — Project Plan
+
+## Project overview
+
+**Goal:** Build an interactive decision-support tool that flags humanitarian projects with unusually high or low beneficiary-to-budget ratios and recommends comparable projects for benchmarking.
+
+**Data source:** `global_cbpf_project_summary.csv` only (17,581 records; 52 columns; allocation years 2010–2026, per initial dataset inspection).
+
+**Scope:** Statistical, peer-relative anomaly detection—not a determination that a project is efficient, inefficient, or appropriately targeted in real-world terms. No GLIDE event or CBPF contributions dataset is required for the MVP.
+
+**Main outputs:** Clean project-level analysis table, peer-matching method, anomaly scores and flags, submission-date time-series trends, evaluation report, and deployed interactive dashboard.
+
+### Primary metric and interpretation
+
+The **primary beneficiary-to-budget ratio** is:
+
+$$
+\boxed{\text{Beneficiaries per \$1,000} = \frac{\text{Beneficiaries}}{\text{Budget}} \times 1000}
+$$
+
+Here, `Beneficiaries = Men + Women + Boys + Girls`, **only if** the four fields are additive, non-overlapping population categories in the data documentation. A **high** value means more reported beneficiaries per $1,000, and a **low** value means fewer. Neither directly proves better or worse targeting. For budget > 0 and beneficiaries > 0, the optional reciprocal cost-per-beneficiary metric is `Budget / Beneficiaries`, but it is not the primary anomaly metric or time-series y-axis.
+
+**New analytic question:** How does the reported number of beneficiaries per $1,000 of project budget vary across project-submission periods and countries/funds? Can unusual project-level ratios be interpreted alongside historical trends? This is a descriptive context analysis, **not** direct measurement of crisis severity.
+
+## Phase 1 — Exploratory Data Analysis (EDA)
+
+**Objective:** Understand the data's structure, quality, distributions, and available project characteristics.
+
+### 1.1 Inspect structure and quality
+- Confirm the unit of analysis and check uniqueness of `ChfProjectCode`.
+- Check missingness, duplicate records, and inconsistent types.
+- Examine zero, negative, and extreme budgets and beneficiary counts.
+- Check whether beneficiary values represent planned targets or actual people reached; record any uncertainty.
+- Examine available country, year, organization, project status, duration, and title fields.
+- Identify projects that may not directly serve beneficiaries (e.g., administrative projects).
+
+**Initial observations from earlier inspection (verify in reproducible EDA):**
+
+| Metric | Preliminary result |
+|---|---:|
+| Rows | 17,581 |
+| Distinct `ChfProjectCode` values | 17,581 |
+| Records with zero total beneficiaries | 497 |
+| Records with zero or negative budgets | 2 |
+| Records with positive budget and beneficiaries | 17,084 |
+| Pooled funds represented | 37 |
+| Missing `ProjectDuration` values | 110 |
+
+### 1.2 Visualize key variables
+- Budget distribution (raw and log scale).
+- Total beneficiaries distribution (raw and log scale).
+- Budget vs. beneficiaries scatterplot, ideally on log scales.
+- Beneficiaries-per-$1,000 distribution, overall and by country/year.
+- Differences by `OrganizationType`, `ProjectDuration`, and `ProjectStatus`.
+- Counts of projects and potential anomalies by country and allocation year.
+
+### 1.3 Assess time-series suitability and grouping fields
+- Inspect `DateSubmitted` for missing or unparseable timestamps, time span, year/month coverage, and project counts per period. The file contains mixed timestamp formats, so use a mixed-format parser and verify parsing results rather than treating legitimate records as missing.
+- Assess whether each country/fund and month has enough projects and nonzero beneficiaries for a stable trend; consider quarterly or annual aggregation if monthly groups are sparse.
+- Compare `DateSubmitted` with `AllocationYear`, `ProjectStartDate`, and `ApprovedDate` to understand interpretation. `DateSubmitted` measures **submission timing**, not crisis occurrence, delivery, or expenditure timing.
+- Check possible grouping dimensions: `PooledFundName` (preferred initial grouping), `OrganizationType`, `AllocationSourceName`, `AllocationTypeCategory` (heavily missing), and validated sector labels if derivable.
+- **No explicit event type or crisis-severity indicator is provided in this CSV.** `AllocationType` is a funding allocation type, not a natural-disaster event type; do not label it as crisis severity. Project status and allocation type also must not be casually treated as severity proxies.
+
+### 1.4 Assess sector information
+- The CSV has no explicit humanitarian cluster/sector column.
+- Investigate whether `ChfProjectCode` has documented sector encoding; **do not guess sector mappings from code fragments**.
+- Inspect `ProjectTitle` for service-category clues. Title-based labels may be explored as an optional feature, but must be tested and marked as inferred.
+- If no reliable sector classification can be obtained from this file, document this as a major limitation and avoid treating projects across different service types as fully comparable.
+
+**Deliverable:** Reproducible EDA notebook, summary tables/figures, and data inclusion/exclusion decisions.
+
+## Phase 2 — Data cleaning and feature engineering
+
+**Objective:** Build a dependable one-row-per-project analysis table.
+
+### 2.1 Clean and flag records
+- Convert monetary and count fields to numeric, handling invalid entries explicitly.
+- Deduplicate only where justified by record IDs and content.
+- Flag `Budget <= 0` as ineligible for ratio calculations.
+- Treat zero-beneficiary projects separately rather than automatically declaring them anomalous.
+- Parse `ProjectDuration` into a consistent numeric measure or compute duration from project dates.
+- Standardize categories and examine project status and administrative projects.
+- Preserve a data-quality flag and reason for exclusions.
+
+### 2.2 Engineer features
+
+| Feature | Definition | Purpose |
+|---|---|---|
+| `total_beneficiaries` | `Men + Women + Boys + Girls` | Reported beneficiary volume, subject to interpretation checks |
+| `beneficiaries_per_1000` | `(total_beneficiaries / Budget) * 1000` | **Primary benchmarking and time-series ratio** |
+| `cost_per_beneficiary` | `Budget / total_beneficiaries` where count > 0 | Optional reciprocal, not the main ratio |
+| `log_budget` | `ln(Budget)` for Budget > 0 | Reduce budget skew |
+| `log_ratio` | `ln(beneficiaries_per_1000)` for ratio > 0 | Robust modeling of skewed ratios |
+| `duration_months` | Parsed duration | Similarity feature |
+| `sector_label` | Verified or validated classification, only if feasible | Optional matching criterion |
+| `eligible_for_benchmark` | Rule-based indicator | Auditability |
+| `submission_month`, `submission_quarter`, `submission_year` | Parsed from `DateSubmitted` | Time-series aggregation |
+| `time_group` | Country/fund, organization type, or validated sector | Comparing trends; not a measured crisis severity category |
+
+**Important:** Confirm the meaning of the gender/age beneficiary columns before treating their sum as unique people. If categories overlap or report different measures, adjust the metric accordingly.
+
+### 2.3 Build a country-period summary table (without replacing project-level data)
+- Keep the primary dataset at **one row per project**.
+- Create a *separate derived table*, one row per `PooledFundName` × submission month (and optional other grouping fields).
+- For each group-period, compute `project_count`, `sum_budget`, `sum_beneficiaries`, and **`aggregate_beneficiaries_per_1000 = (sum_beneficiaries / sum_budget) * 1000`**, provided `sum_budget > 0`. Use consistent eligibility filters for both sums.
+- Also calculate the median **project-level beneficiaries per $1,000** and its interquartile range as a complementary view. These statistics answer a different question from the pooled ratio; do not confuse them.
+- For the pooled ratio, carefully define which projects are included: positive budgets and beneficiaries, and optionally exclude identified administrative/non-direct-service projects; disclose these filters. Investigate zero-beneficiary projects separately.
+- Do **not** use the unweighted average of individual beneficiaries-per-$1,000 ratios as the pooled portfolio ratio: the pooled ratio is a **budget-weighted average** of project-level ratios.
+- Track group sample sizes and suppress or warn on unstable points with too few projects.
+
+**Deliverable:** Clean project-level CSV or Parquet, separate country-period trend table, data dictionary, and reproducible processing script.
+
+## Phase 3 — Comparable-project matching
+
+**Objective:** Recommend fair, interpretable peers for each eligible project.
+
+### 3.1 Choose similarity criteria
+
+| Candidate field | Role |
+|---|---|
+| Verified humanitarian sector | High priority, **if available** |
+| `PooledFundName` | Prefer same country/fund |
+| `AllocationYear` | Prefer nearby years |
+| `Budget` / `log_budget` | Match similar financial scale |
+| `ProjectDuration` / `duration_months` | Match similar project scope |
+| `OrganizationType` | Optional refinement |
+
+Start with **rule-based matching plus nearest neighbors**, not K-means by default. Compare same-country and nearby-year projects, then rank candidates by a transparent weighted similarity score. Broaden matching only when necessary and disclose fallback rules.
+
+For projects *i* and *j*:
+
+\[
+d(i,j) = \sum_k w_k d_k(i,j)
+\]
+
+Here, `d_k` is a normalized distance or mismatch for feature `k`, and `w_k` is its weight. Do **not** use beneficiaries-per-$1,000 as a feature in peer retrieval: doing so would select projects with similar outcomes and potentially conceal anomalies.
+
+### 3.2 Handle small comparison groups
+- Set a preliminary target of at least 20 valid peers; test this threshold empirically.
+- If a project has too few matches, relax lower-priority restrictions (e.g., year window), not essential sector constraints if sector is known.
+- Return *insufficient comparable data* when a meaningful benchmark cannot be formed.
+
+**Deliverable:** A function that accepts a project ID and returns ranked comparable projects with explanations of the match criteria.
+
+## Phase 4 — Outlier detection and benchmarking
+
+**Objective:** Flag unusually high or low ratios relative to selected peers.
+
+### Model A: Percentile / IQR baseline
+For each project's peer set:
+- Calculate the median, Q1, Q3, and IQR.
+- Calculate the target project's percentile rank.
+- Consider conventional thresholds: lower = `Q1 - 1.5 × IQR`, upper = `Q3 + 1.5 × IQR`.
+- Recognize that skewed positive ratios may produce a negative lower bound and fail to flag unusually low ratios.
+
+### Model B: Robust log-ratio score
+For eligible projects with positive ratios, compute:
+
+\[
+z_i = \frac{\log(r_i)-\operatorname{median}(\log(r_{\mathrm{peers}}))}
+{1.4826\,\operatorname{MAD}(\log(r_{\mathrm{peers}}))}
+\]
+
+where `r_i` is the target project's beneficiary-to-budget ratio and MAD is median absolute deviation. A candidate threshold is `|z_i| > 3`, subject to calibration; handle zero MAD and tiny peer sets explicitly.
+
+### Outputs per project
+- Beneficiaries per $1,000 (**primary**), and optional reciprocal cost per beneficiary.
+- Peer-group median, quantiles, and number of peers.
+- Percentile and/or robust standardized anomaly score.
+- Flag: unusually low, typical, unusually high, or insufficient data.
+- Top comparable projects and the reasons for their selection.
+
+Avoid labels like “wasteful,” “successful,” or “incorrect targeting.” These are **statistical flags for review**.
+
+**Deliverable:** Reproducible benchmark and anomaly scoring pipeline.
+
+### Time-series trend and change detection (secondary analysis)
+
+For country/fund `c` and submission period `t`, compute the plotted value as:
+
+$$
+R_{c,t} = \frac{\sum_{i \in (c,t)} (\mathrm{Men}_i + \mathrm{Women}_i + \mathrm{Boys}_i + \mathrm{Girls}_i)}{\sum_{i \in (c,t)} \mathrm{Budget}_i} \times 1000\,.
+$$
+
+This is the **ratio of totals**, not the simple arithmetic mean of project ratios. Use submission **month** or **quarter** as the x-axis (dates derived from `DateSubmitted`). Use country/fund or another documented project attribute as the series grouping. **Event type and crisis severity are not present as verified columns**; do not represent these groupings as severity levels. Optionally draw a second line showing median individual-project ratio to expose changes in the project mix.
+
+In parallel with project-level outlier detection:
+- Plot **`aggregate_beneficiaries_per_1000`** from `DateSubmitted` by month/quarter for selected countries/funds, or validated service sectors if available.
+- Let users compare a country/fund's trend with its historical baseline (e.g., rolling median) and inspect potentially unusual jumps/drops, provided there are enough observations.
+- Flag abnormal **group-period changes** using a robust rolling benchmark or change-point approach only after checking sample sizes and robustness; mark these separately from individual project outlier flags.
+- Allow drill-down from an unusual month to the projects contributing to that period's aggregate, including unusually large budgets or small beneficiary denominators.
+- Note changes may be caused by project mix, submission volume, reporting conventions, or selective submissions—not necessarily a change in crisis severity or actual service efficiency.
+
+**Additional Phase 4 deliverable:** Time-indexed country/fund trends and optional group-period change indicators.
+
+## Phase 5 — Evaluation and validation
+
+**Objective:** Demonstrate that the benchmark is useful, stable, and interpretable.
+
+There are no verified ground-truth labels of genuinely problematic projects in the dataset. Therefore, do **not** report classification accuracy or precision/recall as if true targeting errors were known.
+
+### Evaluation questions
+1. **Peer relevance:** Are projects similar in geography, year, scale, duration, and sector when verified?
+2. **Flag stability:** Do flags persist across different peer counts, distance weights, and anomaly thresholds?
+3. **Baseline comparison:** How do global outliers differ from matched-peer outliers?
+4. **Method comparison:** How do IQR/percentile flags compare with robust log-ratio scores?
+5. **Interpretability:** Can an analyst explain why a project was flagged and why specific peers were recommended?
+
+### Planned experiments
+- Global benchmark vs. peer-adjusted benchmark.
+- IQR vs. log-ratio robust Z-score.
+- Sensitivity analysis over peer count, year range, weights, and thresholds.
+- Manual review of a stratified sample of flagged and unflagged projects using available project descriptions.
+- Time-series checks: compare monthly vs. quarterly aggregation, pooled beneficiaries-per-$1,000 ratio vs. median project ratio, minimum group sizes, and effects of extreme or zero-beneficiary records.
+- Verify that a flagged trend period can be traced to its contributing projects; inspect submission-date artifacts and project-composition shifts.
+- Optional simple usability testing of whether users can interpret the comparisons without treating anomalies as proof of inefficiency.
+
+**Deliverable:** Evaluation notebook/report with comparison tables, sensitivity findings, and examples of defensible and questionable matches.
+
+## Phase 6 — Final interactive product and deployment
+
+**Objective:** Deliver an accessible tool for project exploration and benchmarking.
+
+### Suggested user journey
+1. **Find a project:** Search by project code, title, country, year, or organization.
+2. **Inspect the project:** Display budget, beneficiary counts, ratio, and data-quality context.
+3. **View the benchmark:** Show the peer distribution, median, percentile, and anomaly flag.
+4. **Review comparable projects:** List nearest peers and explain matching criteria.
+5. **Explore changes over time:** Open a country/fund trend view with `DateSubmitted` on the x-axis and **aggregate beneficiaries per $1,000 of budget (people/$1,000)** on the y-axis; optionally compare organization types or validated sectors.
+6. **Investigate unusual periods:** Click a peak or drop to see the underlying submitted projects, their budgets, beneficiary targets, and individual anomaly flags.
+7. **Investigate results:** Compare budgets, beneficiaries, duration, year, and organization; show interpretive cautions.
+
+### Dashboard components
+- Project explorer with filters.
+- Summary of available projects and distribution of ratios.
+- **Interactive time-series panel:** filter by country/fund, submission period (monthly/quarterly/annual), and optionally organization type or validated sector; show **aggregate beneficiaries per $1,000**, project count, and optional median project ratio.
+- **Trend drill-down:** select a time period to examine the projects driving its value, with warnings on sparse observations and changes in project mix.
+- Project detail view and benchmark plot.
+- Comparable-project table (optionally sortable).
+- Anomaly explanation and documentation of exclusions and uncertainty.
+- Methods/about page defining the ratio and limitations.
+
+**Technology options:** Streamlit + Python for a rapid MVP, or React frontend with Python-precomputed results/API for more customized interaction.
+
+**Deliverable:** Deployed dashboard with versioned data/model outputs, country-period trend table, source code, README, and a short demonstration.
+
+## Proposed two-week MVP schedule
+
+| Days | Activity | Deliverable |
+|---|---|---|
+| 1–2 | EDA, data profiling, sector/time feasibility | EDA notebook and decisions |
+| 3–4 | Cleaning, feature engineering, submission-date grouping | Project-level and country-period tables |
+| 5–6 | Similar-project retrieval | Matching pipeline |
+| 7–8 | Outlier scoring models | Baseline and robust scores |
+| 9–10 | Model comparison and case review | Evaluation report |
+| 7–12 (parallel) | Dashboard, including time series and drill-down | Working web prototype |
+| 13–14 | Usability testing, fixes, deployment | MVP and documentation |
+
+## Minimum success criteria
+
+- **Data reliability:** Eligibility rules, missingness, and zero-beneficiary handling are reproducible.
+- **Comparable peers:** The app explains why each peer was selected and reports insufficient matches where appropriate.
+- **Interpretable flags:** Users see peer-relative anomaly measures—not unsupported claims about real-world targeting quality.
+- **Functional product:** A user can select a project, view its metrics, inspect peers, understand its flag, and explore country/fund submission-date trends with drill-down.
+- **Documented limitations:** The absence of verified humanitarian sector, event type, crisis severity, and needs-assessment indicators is made explicit. Submission-date and beneficiary-count interpretations are labeled carefully.
+
+## Immediate next actions
+
+1. Start the EDA notebook and verify the preliminary dataset statistics.
+2. Confirm the meaning of beneficiary columns and whether they can be summed safely.
+3. Investigate sector information in project codes and titles, but do not assume an official sector mapping without evidence.
+4. Define eligibility criteria and build the initial ratio distribution.
+5. Build the first monthly country/fund trend table and check group sizes; compare with quarterly aggregation.
+6. Implement a simple matching baseline, then evaluate more sophisticated scoring only if needed.
+
+## Execution status (2026-11-22)
+
+- Phases 1-2 complete (see Phase1_EDA and Phase2_Cleaning_Features folders).
+- Phases 3-4 core built and executed: peer-matching shortlists, log-scale IQR outlier flags (cohort = fund × allocation source × category, ±2 years, ≥12 peers), and GLIDE event linkage (event type / severity by country + allocation year, 23% of projects linked; unlinked labeled, not attributed). See `Phase4_Outlier_Benchmarking/Phase3_4_pipeline.ipynb` (reproducible; writes the UC tables).
+- Unity Catalog tables: `workspace.default.cbpf_projects_enriched` (17,581 projects, 17,084 eligible), `cbpf_project_peer_matches` (top-5 shortlists for 644 flagged projects; self-pairing bug found and fixed — 0 self-pairs, year gaps 0-2), `cbpf_fund_period_trend` (1,204 fund-months).
+- Phase 6 dashboard delivered as an AI/BI dashboard (not Streamlit): `Phase6_Dashboard/Smart Beneficiary Targeting Validation.lvdash.json` — time series of budget per 1,000 beneficiaries grouped by GLIDE event type and by allocation source, project scatter by flag, flagged-project table, peer-shortlist view, global filters. All 12 widgets verified rendering with correct counts (402 high / 242 low flags).
+- Open items: Phase 5 evaluation (flag stability, IQR vs robust z-score), deeper GLIDE coverage (only 23% linked; region-level locations like Syria/Ukraine mostly unmatched), and a documentation/README pass.
